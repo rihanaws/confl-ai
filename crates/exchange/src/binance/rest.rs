@@ -428,10 +428,12 @@ mod tests {
         }
     }
 
-    /// Live testnet network call. Requires internet access; run with the
-    /// rest of `cargo test --workspace` in this environment where testnet
-    /// connectivity is available.
+    /// Live testnet network call. Excluded from the default `cargo test`
+    /// run so PR CI stays deterministic; run explicitly via
+    /// `cargo test --workspace -- --ignored` (see the scheduled/manual
+    /// network-tests CI job).
     #[tokio::test]
+    #[ignore = "requires live Binance Testnet network access"]
     async fn fetch_exchange_info_against_real_testnet() {
         let client = BinanceRestClient::new(BinanceConfig::testnet(String::new(), String::new()));
         let symbols = client.fetch_exchange_info().await.expect("testnet exchangeInfo reachable");
@@ -442,6 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires live Binance Testnet network access"]
     async fn fetch_book_ticker_against_real_testnet() {
         let client = BinanceRestClient::new(BinanceConfig::testnet(String::new(), String::new()));
         let (bid, ask) = client.fetch_book_ticker("BTCUSDT").await.expect("testnet bookTicker reachable");

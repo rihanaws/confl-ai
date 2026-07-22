@@ -7,22 +7,22 @@ pub struct OrderStateMachine;
 
 impl OrderStateMachine {
     pub fn transition(from: OrderStatus, to: OrderStatus) -> Result<OrderStatus> {
-        let legal = match (from, to) {
-            (OrderStatus::Pending, OrderStatus::Submitted) => true,
-            (OrderStatus::Pending, OrderStatus::Rejected) => true,
-            (OrderStatus::Pending, OrderStatus::CancelRequested) => true,
-            (OrderStatus::Submitted, OrderStatus::PartiallyFilled) => true,
-            (OrderStatus::Submitted, OrderStatus::Filled) => true,
-            (OrderStatus::Submitted, OrderStatus::Rejected) => true,
-            (OrderStatus::Submitted, OrderStatus::CancelRequested) => true,
-            (OrderStatus::PartiallyFilled, OrderStatus::PartiallyFilled) => true,
-            (OrderStatus::PartiallyFilled, OrderStatus::Filled) => true,
-            (OrderStatus::PartiallyFilled, OrderStatus::CancelRequested) => true,
-            (OrderStatus::CancelRequested, OrderStatus::Cancelled) => true,
-            (OrderStatus::CancelRequested, OrderStatus::Filled) => true,
-            (OrderStatus::CancelRequested, OrderStatus::PartiallyFilled) => true,
-            _ => false,
-        };
+        let legal = matches!(
+            (from, to),
+            (OrderStatus::Pending, OrderStatus::Submitted)
+                | (OrderStatus::Pending, OrderStatus::Rejected)
+                | (OrderStatus::Pending, OrderStatus::CancelRequested)
+                | (OrderStatus::Submitted, OrderStatus::PartiallyFilled)
+                | (OrderStatus::Submitted, OrderStatus::Filled)
+                | (OrderStatus::Submitted, OrderStatus::Rejected)
+                | (OrderStatus::Submitted, OrderStatus::CancelRequested)
+                | (OrderStatus::PartiallyFilled, OrderStatus::PartiallyFilled)
+                | (OrderStatus::PartiallyFilled, OrderStatus::Filled)
+                | (OrderStatus::PartiallyFilled, OrderStatus::CancelRequested)
+                | (OrderStatus::CancelRequested, OrderStatus::Cancelled)
+                | (OrderStatus::CancelRequested, OrderStatus::Filled)
+                | (OrderStatus::CancelRequested, OrderStatus::PartiallyFilled)
+        );
         if legal {
             Ok(to)
         } else {
