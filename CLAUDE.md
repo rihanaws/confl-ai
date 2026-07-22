@@ -20,8 +20,8 @@ cargo run -p confluence-server                  # serve on 127.0.0.1:8080 (uses 
 ## Database
 
 Neon project `confluence` (id `sweet-math-60573043`), branch `main`, DB `neondb`. Two connection strings in `.env` (git-ignored, never commit):
-- `DATABASE_URL` — owner role, migrations only.
-- `APP_DATABASE_URL` — `confluence_app` role, what the server uses. Subject to RLS; no UPDATE/DELETE on `risk_events`.
+- `DATABASE_URL` — owner role (`BYPASSRLS`). Migrations, and one narrow runtime exception: the outbox worker's claim/status-update pool in `main.rs`/`outbox_worker.rs`, because `exchange_commands`' tenant RLS policy has no notion of "the worker" and would otherwise block its cross-tenant batch claim. That pool is scoped to `exchange_commands` claim/`mark_*`/`requeue` calls only — never passed into `AppState`, never reachable from an HTTP handler, never used for account/order/fill/position writes. Any new use of `DATABASE_URL` at runtime outside that narrow surface is a regression; flag it.
+- `APP_DATABASE_URL` — `confluence_app` role, what the server (and all HTTP handlers) use. Subject to RLS; no UPDATE/DELETE on `risk_events`.
 
 Rules that must not regress:
 - Money is `rust_decimal::Decimal` ↔ `NUMERIC(30,10)`. Never floats.
