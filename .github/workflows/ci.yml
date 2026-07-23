@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      # Owner connection (superuser on the service container). Migrations
+      # and the outbox worker's cross-tenant claim use this role, matching
+      # docs/DATABASE.md.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      # Bootstrapped below as a normal login role; the app connects as this
+      # for every RLS-scoped query, matching APP_DATABASE_URL in .env.
+      APP_DATABASE_URL: postgresql://confluence_app:confluence_app_ci_password@localhost:5432/postgres
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Bootstrap confluence_app role
+        run: |
+          psql "$DATABASE_URL" -v app_password='confluence_app_ci_password' -f scripts/bootstrap_app_role.sql
+
+      - name: Run migrations
+        run: cargo run -p confluence-server --bin migrate
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --all-targets
+
+      - name: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace

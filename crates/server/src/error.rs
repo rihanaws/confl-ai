@@ -13,6 +13,14 @@ pub enum ApiError {
     Invalid(String),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
+    #[error(transparent)]
+    Exchange(#[from] confluence_exchange::ExchangeError),
+}
+
+impl From<crate::validators::ValidationError> for ApiError {
+    fn from(e: crate::validators::ValidationError) -> Self {
+        ApiError::Invalid(e.0)
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -23,6 +31,13 @@ impl IntoResponse for ApiError {
             ApiError::Invalid(_) => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
             ApiError::Db(e) => {
                 tracing::error!(error = %e, "database error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
+            }
+            ApiError::Exchange(e) => {
+                tracing::error!(error = %e, "exchange adapter error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),
