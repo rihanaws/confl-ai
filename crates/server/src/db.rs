@@ -650,13 +650,18 @@ pub async fn apply_position_delta(
     let new_side = if new_signed > Decimal::ZERO { "long" } else { "short" };
     let new_qty = new_signed.abs();
 
-    // A flip (sign change) or a same-direction increase resets/extends the
-    // entry price to the fill price; the exact avg-price weighting for
-    // partial adds is a follow-up refinement, not required for Phase 2's
-    // reconciliation correctness (fills/positions/events land atomically
-    // either way).
-    let grew_same_direction = (side == "long") == (new_signed > Decimal::ZERO) && new_qty > current_qty;
-    let avg_price = if grew_same_direction {
+    // A flip (sign change) resets the entry price to the fill price. Same
+    // direction, either growing or partially closing, keeps the existing
+    // avg_entry_price — a partial close doesn't change the cost basis of
+    // the remaining quantity, it only realizes P&L on the closed portion.
+    // The exact avg-price weighting for partial adds (blending the new
+    // fill into a moving average) is a follow-up refinement, not required
+    // for Phase 2's reconciliation correctness (fills/positions/events
+    // land atomically either way) — but preserving the basis on a
+    // same-direction *reduction* is required, since overwriting it here
+    // corrupts every later notional check on the remaining position.
+    let same_direction = (side == "long") == (new_signed > Decimal::ZERO);
+    let avg_price = if same_direction {
         row.get::<Decimal, _>("avg_entry_price")
     } else {
         fill_price
