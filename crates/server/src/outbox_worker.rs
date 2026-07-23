@@ -350,6 +350,35 @@ async fn dispatch(
                 .cancel(&snapshot.order)
                 .await
                 .map_err(|_| DispatchOutcome::Retry)?;
+
+            // Cancel accepted by the exchange: mark the order CancelRequested
+            // so a pending reconciliation pass and the mode-switch open-
+            // activity guard both see it's no longer plain open, without
+            // guessing whether it lands as Cancelled/PartiallyFilled/Filled
+            // — that final state is confirmed by the next reconcile_order.
+            let mut tx = db::tenant_tx(app_pool, cmd.account_id)
+                .await
+                .map_err(|_| DispatchOutcome::Retry)?;
+            let locked = db::lock_order(&mut tx, cmd.account_id, order_id)
+                .await
+                .map_err(|_| DispatchOutcome::Retry)?;
+            if confluence_exchange::order_state::OrderStateMachine::transition(
+                locked.status,
+                confluence_exchange::types::OrderStatus::CancelRequested,
+            )
+            .is_ok()
+            {
+                db::update_order_status(
+                    &mut tx,
+                    cmd.account_id,
+                    order_id,
+                    confluence_exchange::types::OrderStatus::CancelRequested,
+                    locked.filled_quantity,
+                )
+                .await
+                .map_err(|_| DispatchOutcome::Retry)?;
+            }
+            tx.commit().await.map_err(|_| DispatchOutcome::Retry)?;
             Ok(())
         }
         _ => Err(DispatchOutcome::ReconciliationRequired),

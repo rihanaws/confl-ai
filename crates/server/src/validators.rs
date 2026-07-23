@@ -114,8 +114,8 @@ fn validate_market(
 }
 
 /// PERCENT_PRICE / PERCENT_PRICE_BY_SIDE (Fix 3): both variants handled.
-/// Limit buy checks ask-side bounds under `BySide`, else `General`
-/// bidirectionally; limit sell checks bid-side bounds under `BySide`.
+/// Limit buy checks bid-side bounds under `BySide`, else `General`
+/// bidirectionally; limit sell checks ask-side bounds under `BySide`.
 fn check_percent_price(
     side: OrderSide,
     price: Decimal,
@@ -151,8 +151,8 @@ fn check_percent_price(
             ..
         } => {
             let (up, down) = match side {
-                OrderSide::Buy => (ask_multiplier_up, ask_multiplier_down),
-                OrderSide::Sell => (bid_multiplier_up, bid_multiplier_down),
+                OrderSide::Buy => (bid_multiplier_up, bid_multiplier_down),
+                OrderSide::Sell => (ask_multiplier_up, ask_multiplier_down),
             };
             let upper = reference * up;
             let lower = reference * down;

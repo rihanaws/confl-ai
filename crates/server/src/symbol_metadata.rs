@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use confluence_exchange::types::SymbolMeta;
+use confluence_exchange::types::{SymbolMeta, SymbolStatus};
 use dashmap::DashMap;
 
 pub struct SymbolMetadataStore {
@@ -47,6 +47,23 @@ impl SymbolMetadataStore {
             None => true,
             Some(t) => t.elapsed() > self.max_age,
         }
+    }
+
+    /// Symbols that can actually pass `validate_order` right now: the same
+    /// `status == Trading` gate the validator applies, on fresh metadata
+    /// only. Drives what the market-data poller watches, so a symbol never
+    /// gets through order validation without a price feed backing it —
+    /// and the poller doesn't waste requests on Break/Halt/AuctionMatch
+    /// symbols the validator would reject anyway.
+    pub fn tradable_symbols(&self) -> Vec<String> {
+        if self.is_stale() {
+            return vec![];
+        }
+        self.symbols
+            .iter()
+            .filter(|e| e.value().status == SymbolStatus::Trading)
+            .map(|e| e.key().clone())
+            .collect()
     }
 }
 
@@ -127,5 +144,30 @@ mod tests {
         let store = SymbolMetadataStore::new(Duration::from_secs(60));
         store.replace_all(vec![meta("BTCUSDT")]);
         assert!(store.get("ETHUSDT").is_none());
+    }
+
+    fn meta_with_status(symbol: &str, status: SymbolStatus) -> SymbolMeta {
+        SymbolMeta { status, ..meta(symbol) }
+    }
+
+    #[test]
+    fn tradable_symbols_excludes_non_trading_status() {
+        let store = SymbolMetadataStore::new(Duration::from_secs(60));
+        store.replace_all(vec![
+            meta_with_status("BTCUSDT", SymbolStatus::Trading),
+            meta_with_status("ETHUSDT", SymbolStatus::Halt),
+            meta_with_status("BNBUSDT", SymbolStatus::Break),
+        ]);
+        let mut tradable = store.tradable_symbols();
+        tradable.sort();
+        assert_eq!(tradable, vec!["BTCUSDT".to_string()]);
+    }
+
+    #[test]
+    fn tradable_symbols_empty_when_stale() {
+        let store = SymbolMetadataStore::new(Duration::from_millis(1));
+        store.replace_all(vec![meta_with_status("BTCUSDT", SymbolStatus::Trading)]);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(store.tradable_symbols().is_empty());
     }
 }

@@ -78,11 +78,29 @@ impl BinanceAdapter {
 
         let mut fills_to_add = vec![];
         if delta > Decimal::ZERO {
-            let price: Decimal = resp
+            // The order's `price` field is the submitted limit price (zero
+            // for market orders) — not what actually executed. Binance's
+            // order-status response also carries `cummulativeQuoteQty`, the
+            // total quote spent/received across all fills so far; dividing
+            // by `executedQty` gives the true average fill price for this
+            // delta, correct for both market and limit orders. Only fall
+            // back to the submitted price if the quote total is unusable
+            // (e.g. a stub/test response omitting it).
+            let cumulative_quote: Decimal = resp
+                .get("cummulativeQuoteQty")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::ZERO);
+            let submitted_price: Decimal = resp
                 .get("price")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(Decimal::ZERO);
+            let price = if cumulative_quote > Decimal::ZERO && executed_qty > Decimal::ZERO {
+                cumulative_quote / executed_qty
+            } else {
+                submitted_price
+            };
             fills_to_add.push(crate::types::Fill {
                 exchange_trade_id: format!("{}:reconcile:{}", order.client_order_id, Uuid::now_v7()),
                 quantity: delta,
@@ -222,14 +240,38 @@ mod tests {
     #[test]
     fn filled_status_maps_to_fill_and_position_delta() {
         let a = adapter();
-        let resp = json!({ "status": "FILLED", "executedQty": "1.00000000", "price": "100.00000000" });
+        let resp = json!({
+            "status": "FILLED",
+            "executedQty": "1.00000000",
+            "price": "100.00000000",
+            "cummulativeQuoteQty": "100.00000000"
+        });
         let result = a
             .map_order_status_response(&snapshot(OrderStatus::Submitted), &resp)
             .unwrap();
         assert_eq!(result.new_status, Some(OrderStatus::Filled));
         assert_eq!(result.fills_to_add.len(), 1);
         assert_eq!(result.fills_to_add[0].quantity, dec!(1));
+        assert_eq!(result.fills_to_add[0].price, dec!(100));
         assert_eq!(result.positions_delta[0].quantity_delta, dec!(1));
+    }
+
+    #[test]
+    fn market_order_fill_price_derived_from_quote_qty_not_submitted_price() {
+        let a = adapter();
+        // Market order: submitted `price` is 0 (Binance always reports this
+        // for MARKET orders), true execution price must come from
+        // cummulativeQuoteQty / executedQty instead.
+        let resp = json!({
+            "status": "FILLED",
+            "executedQty": "2.00000000",
+            "price": "0.00000000",
+            "cummulativeQuoteQty": "205.00000000"
+        });
+        let result = a
+            .map_order_status_response(&snapshot(OrderStatus::Submitted), &resp)
+            .unwrap();
+        assert_eq!(result.fills_to_add[0].price, dec!(102.5));
     }
 
     #[test]
