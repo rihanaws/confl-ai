@@ -101,8 +101,21 @@ impl BinanceAdapter {
             } else {
                 submitted_price
             };
+            // Content-addressed, not random: `GET /api/v3/order` (order
+            // status) exposes only aggregate executedQty/cummulativeQuoteQty,
+            // no per-trade tradeId, so the fill-count ordinal is the
+            // available stable id. A lease-expiry re-claim replays this same
+            // reconcile pass against the same `snapshot.fills`, so the
+            // ordinal must stay identical across retries — that's what lets
+            // `insert_fill`'s `ON CONFLICT (account_id, exchange_trade_id)
+            // DO NOTHING` dedupe the retry instead of double-counting the
+            // fill and position delta.
             fills_to_add.push(crate::types::Fill {
-                exchange_trade_id: format!("{}:reconcile:{}", order.client_order_id, Uuid::now_v7()),
+                exchange_trade_id: format!(
+                    "{}:reconcile:{}",
+                    order.client_order_id,
+                    snapshot.fills.len()
+                ),
                 quantity: delta,
                 price,
                 fee: Decimal::ZERO,

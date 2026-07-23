@@ -82,7 +82,13 @@ impl ExchangeAdapter for PaperAdapter {
             md.conservative_estimate(&order.symbol, is_buy, Instant::now())
         };
 
-        let trade_id = format!("{}:paper:{}", order.client_order_id, Uuid::now_v7());
+        // Content-addressed, not random: a lease-expiry re-claim replays
+        // this same reconcile pass against the same `snapshot.fills`, so
+        // the ordinal (fill count so far) must be stable across retries —
+        // that's what lets `insert_fill`'s `ON CONFLICT (account_id,
+        // exchange_trade_id) DO NOTHING` dedupe the retry instead of
+        // double-counting the fill and position delta.
+        let trade_id = format!("{}:paper:{}", order.client_order_id, snapshot.fills.len());
         let fill = MatchingEngine::try_fill(
             order.order_type,
             order.side,
