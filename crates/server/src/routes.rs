@@ -4,16 +4,35 @@ use axum::{Json, Router};
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use confluence_core::{circuit_breaker_should_trip, evaluate, Decision, TradeIntent};
+use confluence_exchange::paper::market_data::MarketDataProvider;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, Row};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::db;
 use crate::error::ApiError;
+use crate::symbol_metadata::SymbolMetadataStore;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub symbols: Arc<SymbolMetadataStore>,
+    /// Shared with whatever `PaperAdapter` the outbox worker's supervisor
+    /// uses, via `PaperAdapter::with_shared_market_data` — same feed backs
+    /// both this route's pre-trade estimate and the adapter's fills.
+    pub market_data: Arc<Mutex<MarketDataProvider>>,
+}
 
 pub fn app(pool: PgPool) -> Router {
+    let symbols = Arc::new(SymbolMetadataStore::new(std::time::Duration::from_secs(60)));
+    let market_data = Arc::new(Mutex::new(MarketDataProvider::new(std::time::Duration::from_secs(10))));
+    app_with_state(AppState { pool, symbols, market_data })
+}
+
+pub fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/accounts", post(create_account))
         .route("/accounts/{id}", get(get_account))
@@ -32,7 +51,13 @@ pub fn app(pool: PgPool) -> Router {
         )
         .route("/accounts/{id}/evaluate", post(evaluate_trade))
         .route("/accounts/{id}/risk-events", get(list_risk_events))
-        .with_state(pool)
+        .route("/accounts/{id}/orders", post(crate::routes_orders::place_order))
+        .route(
+            "/accounts/{id}/exchange-config",
+            get(crate::routes_exchange::get_exchange_config)
+                .put(crate::routes_exchange::put_exchange_config),
+        )
+        .with_state(state)
 }
 
 // ---------- accounts ----------
@@ -52,9 +77,10 @@ pub struct AccountView {
 }
 
 async fn create_account(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     body: Option<Json<CreateAccount>>,
 ) -> Result<(StatusCode, Json<AccountView>), ApiError> {
+    let pool = state.pool.clone();
     let equity = body.and_then(|b| b.0.equity).unwrap_or(Decimal::ZERO);
     if equity < Decimal::ZERO {
         return Err(ApiError::Invalid("equity must be >= 0".into()));
@@ -85,9 +111,10 @@ async fn create_account(
 }
 
 async fn get_account(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AccountView>, ApiError> {
+    let pool = state.pool.clone();
     let mut tx = db::tenant_tx(&pool, id).await?;
     let row = sqlx::query(
         "SELECT status, equity, kill_switch_engaged_at IS NOT NULL AS ks FROM accounts WHERE id = $1",
@@ -110,10 +137,11 @@ pub struct PutEquity {
 }
 
 async fn put_equity(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<PutEquity>,
 ) -> Result<StatusCode, ApiError> {
+    let pool = state.pool.clone();
     if body.equity < Decimal::ZERO {
         return Err(ApiError::Invalid("equity must be >= 0".into()));
     }
@@ -147,9 +175,10 @@ pub struct RiskConfigView {
 }
 
 async fn get_risk_config(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<RiskConfigView>, ApiError> {
+    let pool = state.pool.clone();
     let mut tx = db::tenant_tx(&pool, id).await?;
     let (cfg, version) = db::load_risk_config(&mut tx, id).await?;
     Ok(Json(RiskConfigView {
@@ -162,10 +191,11 @@ async fn get_risk_config(
 }
 
 async fn put_risk_config(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<RiskConfigView>,
 ) -> Result<Json<RiskConfigView>, ApiError> {
+    let pool = state.pool.clone();
     let pct = |name: &str, v: Decimal| -> Result<(), ApiError> {
         if v <= Decimal::ZERO || v > Decimal::ONE_HUNDRED {
             Err(ApiError::Invalid(format!("{name} must be in (0, 100]")))
@@ -253,10 +283,11 @@ pub struct CorrelationGroupDef {
 
 /// Declarative replace of all correlation groups for the account.
 async fn put_correlation_groups(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(groups): Json<Vec<CorrelationGroupDef>>,
 ) -> Result<StatusCode, ApiError> {
+    let pool = state.pool.clone();
     let mut seen = std::collections::HashSet::new();
     for g in &groups {
         if g.name.trim().is_empty() {
@@ -312,9 +343,10 @@ async fn put_correlation_groups(
 // ---------- kill switch ----------
 
 async fn engage_kill_switch(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AccountView>, ApiError> {
+    let pool = state.pool.clone();
     let mut tx = db::tenant_tx(&pool, id).await?;
     let account = db::lock_account(&mut tx, id).await?;
     if !account.kill_switch_engaged {
@@ -337,9 +369,10 @@ async fn engage_kill_switch(
 }
 
 async fn release_kill_switch(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AccountView>, ApiError> {
+    let pool = state.pool.clone();
     let mut tx = db::tenant_tx(&pool, id).await?;
     let account = db::lock_account(&mut tx, id).await?;
     let status = if account.kill_switch_engaged {
@@ -372,10 +405,11 @@ pub struct EvaluateResponse {
 }
 
 async fn evaluate_trade(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(intent): Json<TradeIntent>,
 ) -> Result<Json<EvaluateResponse>, ApiError> {
+    let pool = state.pool.clone();
     if intent.symbol.trim().is_empty() {
         return Err(ApiError::Invalid("symbol must not be empty".into()));
     }
@@ -445,10 +479,11 @@ pub struct RiskEventView {
 }
 
 async fn list_risk_events(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<Vec<RiskEventView>>, ApiError> {
+    let pool = state.pool.clone();
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let mut tx = db::tenant_tx(&pool, id).await?;
     // UUIDv7 ids are time-ordered, so id is a stable pagination cursor.

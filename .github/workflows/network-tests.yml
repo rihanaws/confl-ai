@@ -1,0 +1,32 @@
+name: Network Tests (Binance Testnet)
+
+# Runs the tests marked #[ignore] in crates/exchange/src/binance/rest.rs,
+# which make real network calls to Binance Spot Testnet. Kept out of the
+# main CI workflow so PR/push CI stays deterministic and doesn't depend on
+# an external service's uptime.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Weekly, catches upstream API drift (e.g. Binance changing filter shapes)
+    # without running on every push.
+    - cron: '0 6 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  network-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace -- --ignored
+        run: cargo test --workspace -- --ignored
