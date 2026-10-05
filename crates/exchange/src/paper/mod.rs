@@ -69,6 +69,20 @@ impl ExchangeAdapter for PaperAdapter {
             return Ok(ReconcileResult::default());
         }
 
+        // A cancel accepted by the server leaves the order CancelRequested.
+        // Paper fills only happen inside this reconcile pass, so nothing can
+        // be in flight: the cancel takes effect immediately.
+        if order.status == OrderStatus::CancelRequested {
+            return Ok(ReconcileResult {
+                new_status: Some(OrderStatus::Cancelled),
+                events: vec![RiskEvent {
+                    event_type: "order_cancelled".into(),
+                    payload: json!({ "order_id": order.order_id, "new_status": "Cancelled" }),
+                }],
+                ..ReconcileResult::default()
+            });
+        }
+
         let already_filled: rust_decimal::Decimal =
             snapshot.fills.iter().map(|f| f.quantity).sum();
         let remaining = order.quantity - already_filled;

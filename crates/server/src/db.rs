@@ -450,13 +450,15 @@ pub async fn load_fills_for_order(
         .collect())
 }
 
+/// Returns `true` if the fill row was newly inserted, `false` if it was a
+/// duplicate trade id.
 pub async fn insert_fill(
     conn: &mut PgConnection,
     account_id: Uuid,
     order_id: Uuid,
     fill: &Fill,
-) -> Result<(), ApiError> {
-    sqlx::query(
+) -> Result<bool, ApiError> {
+    let result = sqlx::query(
         "INSERT INTO order_fills (account_id, order_id, exchange_trade_id, quantity, price, fee, fee_asset)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (account_id, exchange_trade_id) DO NOTHING",
@@ -470,7 +472,9 @@ pub async fn insert_fill(
     .bind(&fill.fee_asset)
     .execute(conn)
     .await?;
-    Ok(())
+    // `false` means the trade id already existed (ON CONFLICT DO NOTHING):
+    // a replayed fill whose position/quantity effects must not be re-applied.
+    Ok(result.rows_affected() > 0)
 }
 
 // ---------- exchange commands (outbox) ----------

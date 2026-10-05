@@ -23,6 +23,15 @@ Date: 2026-10-05. Read `../CLAUDE.md` (working rules) and `PHASE2_STATUS.md` fir
 | `paper/mod.rs`, `binance/reconcile.rs` | Fill `exchange_trade_id` = `{client_order_id}:{paper\|reconcile}:{snapshot.fills.len()}` (was random UUID) so lease-expiry retries dedupe via `ON CONFLICT`. |
 | `routes_exchange.rs` | PUT response `has_credentials` reads `api_key_ciphertext IS NOT NULL` from the row. |
 
+## Follow-up fixes from PR #2 review (Greptile, second pass)
+
+- Binance reconcile prices each new fill from the *incremental* quote (cumulative quote minus quote already recorded), not the all-time average.
+- `persist_reconcile_result` applies position delta / `filled_quantity` only for fills actually inserted (`db::insert_fill` now returns `bool`); a replayed pass is a no-op.
+- `cancel_order` writes an `order_cancel_requested` risk event (new migration `0012_cancel_requested_event.sql` — **must be applied** with the `migrate` binary before running the server) and enqueues a `reconcile_order` (`{order_id}:reconcile:post-cancel`). Paper reconcile resolves `CancelRequested` → `Cancelled` immediately.
+- Market-data poller does one all-symbols `bookTicker` request per cycle (`fetch_all_book_tickers`), filtered to tradable symbols. Gap 1 below (polling scale) is resolved.
+- `PERCENT_PRICE_BY_SIDE` tests now use distinct bid/ask multipliers so a swapped mapping fails.
+- These were not compiled locally (no Rust toolchain on the machine at the time); verified by CI only.
+
 ## Docs now stale (fix when touching them)
 
 - `PHASE2_STATUS.md`: says "100/100 tests" (now 101); says watchlist hardcoded (now derived from tradable symbols); says growing a position leaves avg price unchanged and a shrink resets it (shrink now preserves it; add still does not weight).
@@ -30,11 +39,11 @@ Date: 2026-10-05. Read `../CLAUDE.md` (working rules) and `PHASE2_STATUS.md` fir
 
 ## Known gaps / candidate next work
 
-1. **Polling scale.** Poller does one `bookTicker` request per tradable symbol every 5s (sequential). With all Trading symbols this is likely many hundreds of requests per cycle and can exceed the 5s window or Binance rate limits. Fix: one `GET /api/v3/ticker/bookTicker` call without `symbol` (returns all), or the WS stream already scaffolded in `binance/ws.rs`. Highest-priority follow-up.
+1. ~~Polling scale~~ — resolved by the batched `bookTicker` call (see above). WS stream in `binance/ws.rs` remains the longer-term option.
 2. **Trade-ID ordinal is a stopgap.** `GET /api/v3/order` has no per-trade IDs; for live, use `myTrades` (`tradeId`) for true dedup. Also assumes at most one new fill per reconcile pass.
 3. **`avg_entry_price` not weighted on adds** (unchanged from Phase 2 status); no realized-P&L calculation on partial close.
 4. **Paper balance reservations (`PaperAccount`) still not wired** into order placement or the worker.
-5. **`CancelRequested` is still "open"** for `has_open_activity`; it only clears once reconcile reaches a terminal state. Make sure a reconcile is always enqueued after a cancel (verify; not covered by a test).
+5. **`CancelRequested` is still "open"** for `has_open_activity` until reconcile reaches a terminal state. A post-cancel reconcile is now enqueued once; there is still no periodic sweep, so a reconcile that doesn't reach a terminal state is not retried. No test covers the cancel flow.
 6. **Flaky test:** `leased_command_past_expiry_becomes_claimable_again` (`crates/server/tests/phase2_exchange.rs`) failed once under full parallel run, passes alone. Timing-sensitive lease test; stabilise before relying on CI.
 7. **No new tests** were added for: partial-close avg price, `has_credentials`, reconcile-retry dedup, cancel→`CancelRequested`. Add DB integration tests for these.
 8. REST→WS market-data swap, live-enablement gate (auth, 7+ day testnet soak, failure injection, monitoring, written approval), and Phase 3 (LLM worker) remain unstarted. Start only on explicit request per `CLAUDE.md`.
