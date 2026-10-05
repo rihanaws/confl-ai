@@ -76,30 +76,9 @@ pub async fn run_once(
             Ok(()) => {
                 let mut owner_conn = owner_pool.acquire().await?;
                 let _ = db::mark_command_delivered(&mut owner_conn, cmd.id).await;
-                // A delivered submit_order needs a follow-up poll to learn
-                // whether/how it filled — enqueue the first reconcile_order
-                // pass now; reconcile_order itself does not self-repeat
-                // here (a scheduled periodic sweep is the production
-                // mechanism for repeated polling of still-open orders).
-                // A delivered cancel_order likewise leaves the order at
-                // CancelRequested; enqueue a reconcile to confirm the final
-                // state (cancelled, or filled/partially filled if it raced).
-                let reconcile_key = match cmd.command_type.as_str() {
-                    "submit_order" => Some("initial"),
-                    "cancel_order" => Some("post-cancel"),
-                    _ => None,
-                };
-                if let (Some(suffix), Some(order_id)) = (reconcile_key, extract_order_id(&cmd)) {
-                    let _ = db::insert_exchange_command(
-                        &mut owner_conn,
-                        cmd.account_id,
-                        "reconcile_order",
-                        cmd.exchange_mode,
-                        &format!("{order_id}:reconcile:{suffix}"),
-                        &json!({ "order_id": order_id }),
-                    )
-                    .await;
-                }
+                // Follow-up reconcile_order commands are enqueued inside the
+                // same transaction as the state change that needs them (see
+                // `dispatch`), so they can't be lost after delivery.
             }
             Err(DispatchOutcome::Retry) => {
                 let mut owner_conn = owner_pool.acquire().await?;
@@ -235,6 +214,7 @@ async fn persist_reconcile_result(
     app_pool: &PgPool,
     account_id: Uuid,
     order_id: Uuid,
+    snapshot: &ReconcileSnapshot,
     result: confluence_exchange::adapter::ReconcileResult,
 ) -> Result<(), DispatchOutcome> {
     let mut tx = db::tenant_tx(app_pool, account_id)
@@ -247,6 +227,17 @@ async fn persist_reconcile_result(
     let locked = db::lock_order(&mut tx, account_id, order_id)
         .await
         .map_err(|_| DispatchOutcome::Retry)?;
+
+    // Optimistic-concurrency check: the adapter computed `result` from
+    // `snapshot`, taken before this transaction. If a concurrent pass (e.g. a
+    // lease-expiry re-claim) already committed fills or a status change since
+    // then, `result` is stale — its deltas and trade ids were derived from
+    // old state and applying it would drop or double-count quantity. Requeue
+    // so the next pass hydrates a fresh snapshot.
+    let snapshot_filled: rust_decimal::Decimal = snapshot.fills.iter().map(|f| f.quantity).sum();
+    if locked.filled_quantity != snapshot_filled || locked.status != snapshot.order.status {
+        return Err(DispatchOutcome::Retry);
+    }
 
     // Only fills actually inserted count: a duplicate trade id (e.g. a
     // lease-expiry re-claim replaying the same reconcile pass) is ignored by
@@ -262,9 +253,10 @@ async fn persist_reconcile_result(
         }
     }
     if !result.fills_to_add.is_empty() && inserted_fills.is_empty() {
-        // Entire pass is a replay of already-persisted fills: nothing to apply.
-        tx.commit().await.map_err(|_| DispatchOutcome::Retry)?;
-        return Ok(());
+        // The snapshot matched the locked order yet every trade id already
+        // exists: order and fills disagree, so don't silently drop the
+        // result — escalate.
+        return Err(DispatchOutcome::ReconciliationRequired);
     }
 
     // Both adapters (paper matching, Binance reconcile) produce at most one
@@ -345,6 +337,16 @@ async fn dispatch(
                 .await
                 .map_err(|_| DispatchOutcome::Retry)?;
             }
+            db::insert_exchange_command(
+                &mut tx,
+                cmd.account_id,
+                "reconcile_order",
+                cmd.exchange_mode,
+                &format!("{order_id}:reconcile:initial"),
+                &json!({ "order_id": order_id }),
+            )
+            .await
+            .map_err(|_| DispatchOutcome::Retry)?;
             tx.commit().await.map_err(|_| DispatchOutcome::Retry)?;
             Ok(())
         }
@@ -357,7 +359,7 @@ async fn dispatch(
                 .reconcile_order(&snapshot)
                 .await
                 .map_err(classify_exchange_error)?;
-            persist_reconcile_result(app_pool, cmd.account_id, order_id, result).await
+            persist_reconcile_result(app_pool, cmd.account_id, order_id, &snapshot, result).await
         }
         "cancel_order" => {
             let Some(order_id) = extract_order_id(cmd) else {
@@ -404,6 +406,19 @@ async fn dispatch(
                 .await
                 .map_err(|_| DispatchOutcome::Retry)?;
             }
+            // Confirm the final state (cancelled, or filled/partially filled
+            // if it raced). Same transaction as the CancelRequested change, so
+            // the order can't be left without its follow-up.
+            db::insert_exchange_command(
+                &mut tx,
+                cmd.account_id,
+                "reconcile_order",
+                cmd.exchange_mode,
+                &format!("{order_id}:reconcile:post-cancel"),
+                &json!({ "order_id": order_id }),
+            )
+            .await
+            .map_err(|_| DispatchOutcome::Retry)?;
             tx.commit().await.map_err(|_| DispatchOutcome::Retry)?;
             Ok(())
         }

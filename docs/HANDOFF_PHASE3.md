@@ -28,6 +28,8 @@ Date: 2026-10-05. Read `../CLAUDE.md` (working rules) and `PHASE2_STATUS.md` fir
 - Binance reconcile prices each new fill from the *incremental* quote (cumulative quote minus quote already recorded), not the all-time average.
 - `persist_reconcile_result` applies position delta / `filled_quantity` only for fills actually inserted (`db::insert_fill` now returns `bool`); a replayed pass is a no-op.
 - `cancel_order` writes an `order_cancel_requested` risk event (new migration `0012_cancel_requested_event.sql` — **must be applied** with the `migrate` binary before running the server) and enqueues a `reconcile_order` (`{order_id}:reconcile:post-cancel`). Paper reconcile resolves `CancelRequested` → `Cancelled` immediately.
+- `persist_reconcile_result` rejects stale results: if the locked order's `filled_quantity`/status differ from the snapshot the adapter used, it returns `Retry` so the next pass hydrates fresh state (replaces the earlier "all trade ids duplicate = no-op" shortcut, which could discard a newer result).
+- Follow-up `reconcile_order` commands (after submit and after cancel) are inserted in the same tenant transaction as the state change, not after delivery.
 - Market-data poller does one all-symbols `bookTicker` request per cycle (`fetch_all_book_tickers`), filtered to tradable symbols. Gap 1 below (polling scale) is resolved.
 - `PERCENT_PRICE_BY_SIDE` tests now use distinct bid/ask multipliers so a swapped mapping fails.
 - These were not compiled locally (no Rust toolchain on the machine at the time); verified by CI only.
