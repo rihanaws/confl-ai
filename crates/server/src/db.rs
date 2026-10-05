@@ -450,13 +450,15 @@ pub async fn load_fills_for_order(
         .collect())
 }
 
+/// Returns `true` if the fill row was newly inserted, `false` if it was a
+/// duplicate trade id.
 pub async fn insert_fill(
     conn: &mut PgConnection,
     account_id: Uuid,
     order_id: Uuid,
     fill: &Fill,
-) -> Result<(), ApiError> {
-    sqlx::query(
+) -> Result<bool, ApiError> {
+    let result = sqlx::query(
         "INSERT INTO order_fills (account_id, order_id, exchange_trade_id, quantity, price, fee, fee_asset)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (account_id, exchange_trade_id) DO NOTHING",
@@ -470,7 +472,9 @@ pub async fn insert_fill(
     .bind(&fill.fee_asset)
     .execute(conn)
     .await?;
-    Ok(())
+    // `false` means the trade id already existed (ON CONFLICT DO NOTHING):
+    // a replayed fill whose position/quantity effects must not be re-applied.
+    Ok(result.rows_affected() > 0)
 }
 
 // ---------- exchange commands (outbox) ----------
@@ -650,13 +654,18 @@ pub async fn apply_position_delta(
     let new_side = if new_signed > Decimal::ZERO { "long" } else { "short" };
     let new_qty = new_signed.abs();
 
-    // A flip (sign change) or a same-direction increase resets/extends the
-    // entry price to the fill price; the exact avg-price weighting for
-    // partial adds is a follow-up refinement, not required for Phase 2's
-    // reconciliation correctness (fills/positions/events land atomically
-    // either way).
-    let grew_same_direction = (side == "long") == (new_signed > Decimal::ZERO) && new_qty > current_qty;
-    let avg_price = if grew_same_direction {
+    // A flip (sign change) resets the entry price to the fill price. Same
+    // direction, either growing or partially closing, keeps the existing
+    // avg_entry_price — a partial close doesn't change the cost basis of
+    // the remaining quantity, it only realizes P&L on the closed portion.
+    // The exact avg-price weighting for partial adds (blending the new
+    // fill into a moving average) is a follow-up refinement, not required
+    // for Phase 2's reconciliation correctness (fills/positions/events
+    // land atomically either way) — but preserving the basis on a
+    // same-direction *reduction* is required, since overwriting it here
+    // corrupts every later notional check on the remaining position.
+    let same_direction = (side == "long") == (new_signed > Decimal::ZERO);
+    let avg_price = if same_direction {
         row.get::<Decimal, _>("avg_entry_price")
     } else {
         fill_price

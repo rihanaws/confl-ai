@@ -107,6 +107,12 @@ impl BinanceRestClient {
         format!("{}?symbol={symbol}", self.url("/v3/ticker/bookTicker"))
     }
 
+    /// URL for the all-symbols `GET /api/v3/ticker/bookTicker` (no `symbol`
+    /// parameter returns every symbol's top of book in one response).
+    pub fn all_book_tickers_url(&self) -> String {
+        self.url("/v3/ticker/bookTicker")
+    }
+
     pub fn api_key(&self) -> &str {
         &self.config.api_key
     }
@@ -141,6 +147,23 @@ impl BinanceRestClient {
         symbols.iter().map(parse_symbol_meta).collect()
     }
 
+    /// Fetches every symbol's top of book in a single request, so one poll
+    /// pass refreshes all quotes at once instead of N sequential calls whose
+    /// early results could go stale before the pass finishes.
+    pub async fn fetch_all_book_tickers(&self) -> Result<Vec<(String, Decimal, Decimal)>> {
+        let resp = self
+            .http
+            .get(self.all_book_tickers_url())
+            .send()
+            .await
+            .map_err(|e| ExchangeError::MarketDataError(format!("bookTicker request failed: {e}")))?;
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| ExchangeError::MarketDataError(format!("bad bookTicker body: {e}")))?;
+        parse_all_book_tickers(&body)
+    }
+
     /// Fetches `GET /api/v3/ticker/bookTicker` for one symbol (public, no
     /// signing) and returns (bid, ask).
     pub async fn fetch_book_ticker(&self, symbol: &str) -> Result<(Decimal, Decimal)> {
@@ -158,6 +181,24 @@ impl BinanceRestClient {
         let ask = dec_field(&body, "askPrice")?;
         Ok((bid, ask))
     }
+}
+
+/// Parses the all-symbols bookTicker array. Entries that are malformed or
+/// have a non-positive/crossed book are skipped rather than failing the whole
+/// batch (an unused symbol with an empty book must not blank every quote).
+fn parse_all_book_tickers(body: &Value) -> Result<Vec<(String, Decimal, Decimal)>> {
+    let arr = body
+        .as_array()
+        .ok_or_else(|| ExchangeError::MarketDataError("bookTicker response is not an array".into()))?;
+    Ok(arr
+        .iter()
+        .filter_map(|e| {
+            let symbol = e.get("symbol")?.as_str()?.to_string();
+            let bid = dec_field(e, "bidPrice").ok()?;
+            let ask = dec_field(e, "askPrice").ok()?;
+            (bid > Decimal::ZERO && ask >= bid).then_some((symbol, bid, ask))
+        })
+        .collect())
 }
 
 fn dec_field(v: &Value, key: &str) -> Result<Decimal> {
@@ -441,6 +482,20 @@ mod tests {
         let btc = symbols.iter().find(|s| s.symbol == "BTCUSDT").expect("BTCUSDT listed on testnet");
         assert!(btc.lot_size.step_size > Decimal::ZERO);
         assert!(matches!(btc.percent_price, PercentPriceRule::BySide { .. } | PercentPriceRule::General { .. }));
+    }
+
+    #[test]
+    fn all_book_tickers_parsed_and_bad_entries_skipped() {
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "bidPrice": "100.0", "askPrice": "101.0" },
+            { "symbol": "DEADUSDT", "bidPrice": "0.00000000", "askPrice": "0.00000000" },
+            { "symbol": "ETHUSDT", "bidPrice": "10", "askPrice": "11" },
+            { "bidPrice": "1", "askPrice": "2" }
+        ]);
+        let out = parse_all_book_tickers(&body).unwrap();
+        let syms: Vec<&str> = out.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert_eq!(syms, vec!["BTCUSDT", "ETHUSDT"]);
+        assert!(parse_all_book_tickers(&serde_json::json!({"code": -1})).is_err());
     }
 
     #[tokio::test]

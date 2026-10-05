@@ -114,8 +114,8 @@ fn validate_market(
 }
 
 /// PERCENT_PRICE / PERCENT_PRICE_BY_SIDE (Fix 3): both variants handled.
-/// Limit buy checks ask-side bounds under `BySide`, else `General`
-/// bidirectionally; limit sell checks bid-side bounds under `BySide`.
+/// Limit buy checks bid-side bounds under `BySide`, else `General`
+/// bidirectionally; limit sell checks ask-side bounds under `BySide`.
 fn check_percent_price(
     side: OrderSide,
     price: Decimal,
@@ -151,8 +151,8 @@ fn check_percent_price(
             ..
         } => {
             let (up, down) = match side {
-                OrderSide::Buy => (ask_multiplier_up, ask_multiplier_down),
-                OrderSide::Sell => (bid_multiplier_up, bid_multiplier_down),
+                OrderSide::Buy => (bid_multiplier_up, bid_multiplier_down),
+                OrderSide::Sell => (ask_multiplier_up, ask_multiplier_down),
             };
             let upper = reference * up;
             let lower = reference * down;
@@ -312,19 +312,46 @@ mod tests {
         assert!(validate_order(&intent, &m, Some(est(dec!(100), true))).is_ok());
     }
 
-    #[test]
-    fn limit_order_percent_price_by_side_buy_uses_ask_bounds() {
-        // reference 100, ask bounds [80, 120]; buy at 125 is outside.
-        let intent = limit_intent(OrderSide::Buy, dec!(1), dec!(125));
-        let err = validate_order(&intent, &meta(), Some(est(dec!(100), true))).unwrap_err();
-        assert!(err.0.contains("PERCENT_PRICE_BY_SIDE"));
+    /// Distinct bid/ask multipliers so a swapped side mapping fails these
+    /// tests: bid bounds are [90, 110], ask bounds are [70, 130] at ref 100.
+    fn meta_asymmetric_by_side() -> SymbolMeta {
+        let mut m = meta();
+        m.percent_price = PercentPriceRule::BySide {
+            bid_multiplier_up: dec!(1.1),
+            bid_multiplier_down: dec!(0.9),
+            ask_multiplier_up: dec!(1.3),
+            ask_multiplier_down: dec!(0.7),
+            avg_price_mins: 5,
+        };
+        m
     }
 
     #[test]
-    fn limit_order_percent_price_by_side_sell_uses_bid_bounds() {
-        let intent = limit_intent(OrderSide::Sell, dec!(1), dec!(70));
-        let err = validate_order(&intent, &meta(), Some(est(dec!(100), true))).unwrap_err();
+    fn limit_order_percent_price_by_side_buy_uses_bid_bounds() {
+        let m = meta_asymmetric_by_side();
+        let e = || Some(est(dec!(100), true));
+        // Inside bid bounds [90, 110].
+        assert!(validate_order(&limit_intent(OrderSide::Buy, dec!(1), dec!(90)), &m, e()).is_ok());
+        assert!(validate_order(&limit_intent(OrderSide::Buy, dec!(1), dec!(110)), &m, e()).is_ok());
+        // Outside bid bounds but inside ask bounds [70, 130]: must reject for buys.
+        let err = validate_order(&limit_intent(OrderSide::Buy, dec!(1), dec!(120)), &m, e()).unwrap_err();
         assert!(err.0.contains("PERCENT_PRICE_BY_SIDE"));
+        assert!(validate_order(&limit_intent(OrderSide::Buy, dec!(1), dec!(85)), &m, e()).is_err());
+    }
+
+    #[test]
+    fn limit_order_percent_price_by_side_sell_uses_ask_bounds() {
+        let m = meta_asymmetric_by_side();
+        let e = || Some(est(dec!(100), true));
+        // Inside ask bounds [70, 130].
+        assert!(validate_order(&limit_intent(OrderSide::Sell, dec!(1), dec!(70)), &m, e()).is_ok());
+        assert!(validate_order(&limit_intent(OrderSide::Sell, dec!(1), dec!(130)), &m, e()).is_ok());
+        // Inside ask bounds but outside bid bounds: must be accepted for sells.
+        assert!(validate_order(&limit_intent(OrderSide::Sell, dec!(1), dec!(125)), &m, e()).is_ok());
+        // Outside ask bounds: rejected.
+        let err = validate_order(&limit_intent(OrderSide::Sell, dec!(1), dec!(135)), &m, e()).unwrap_err();
+        assert!(err.0.contains("PERCENT_PRICE_BY_SIDE"));
+        assert!(validate_order(&limit_intent(OrderSide::Sell, dec!(1), dec!(65)), &m, e()).is_err());
     }
 
     #[test]

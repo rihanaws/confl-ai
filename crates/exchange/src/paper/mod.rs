@@ -69,6 +69,20 @@ impl ExchangeAdapter for PaperAdapter {
             return Ok(ReconcileResult::default());
         }
 
+        // A cancel accepted by the server leaves the order CancelRequested.
+        // Paper fills only happen inside this reconcile pass, so nothing can
+        // be in flight: the cancel takes effect immediately.
+        if order.status == OrderStatus::CancelRequested {
+            return Ok(ReconcileResult {
+                new_status: Some(OrderStatus::Cancelled),
+                events: vec![RiskEvent {
+                    event_type: "order_cancelled".into(),
+                    payload: json!({ "order_id": order.order_id, "new_status": "Cancelled" }),
+                }],
+                ..ReconcileResult::default()
+            });
+        }
+
         let already_filled: rust_decimal::Decimal =
             snapshot.fills.iter().map(|f| f.quantity).sum();
         let remaining = order.quantity - already_filled;
@@ -82,7 +96,13 @@ impl ExchangeAdapter for PaperAdapter {
             md.conservative_estimate(&order.symbol, is_buy, Instant::now())
         };
 
-        let trade_id = format!("{}:paper:{}", order.client_order_id, Uuid::now_v7());
+        // Content-addressed, not random: a lease-expiry re-claim replays
+        // this same reconcile pass against the same `snapshot.fills`, so
+        // the ordinal (fill count so far) must be stable across retries —
+        // that's what lets `insert_fill`'s `ON CONFLICT (account_id,
+        // exchange_trade_id) DO NOTHING` dedupe the retry instead of
+        // double-counting the fill and position delta.
+        let trade_id = format!("{}:paper:{}", order.client_order_id, snapshot.fills.len());
         let fill = MatchingEngine::try_fill(
             order.order_type,
             order.side,

@@ -78,13 +78,52 @@ impl BinanceAdapter {
 
         let mut fills_to_add = vec![];
         if delta > Decimal::ZERO {
-            let price: Decimal = resp
+            // The order's `price` field is the submitted limit price (zero
+            // for market orders) — not what actually executed. Binance's
+            // order-status response carries `cummulativeQuoteQty`, the total
+            // quote spent/received across ALL fills so far. This pass only
+            // records the new `delta` quantity, so its price is the
+            // incremental quote (cumulative minus the quote already
+            // recorded by earlier passes) divided by `delta` — not the
+            // all-time average, which would misprice a later fill made at a
+            // different price. Fall back to the submitted price only if the
+            // incremental quote is unusable (e.g. a response omitting it).
+            let cumulative_quote: Decimal = resp
+                .get("cummulativeQuoteQty")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::ZERO);
+            let recorded_quote: Decimal = snapshot
+                .fills
+                .iter()
+                .map(|f: &FillSnapshot| f.quantity * f.price)
+                .sum();
+            let incremental_quote = cumulative_quote - recorded_quote;
+            let submitted_price: Decimal = resp
                 .get("price")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(Decimal::ZERO);
+            let price = if incremental_quote > Decimal::ZERO {
+                incremental_quote / delta
+            } else {
+                submitted_price
+            };
+            // Content-addressed, not random: `GET /api/v3/order` (order
+            // status) exposes only aggregate executedQty/cummulativeQuoteQty,
+            // no per-trade tradeId, so the fill-count ordinal is the
+            // available stable id. A lease-expiry re-claim replays this same
+            // reconcile pass against the same `snapshot.fills`, so the
+            // ordinal must stay identical across retries — that's what lets
+            // `insert_fill`'s `ON CONFLICT (account_id, exchange_trade_id)
+            // DO NOTHING` dedupe the retry instead of double-counting the
+            // fill and position delta.
             fills_to_add.push(crate::types::Fill {
-                exchange_trade_id: format!("{}:reconcile:{}", order.client_order_id, Uuid::now_v7()),
+                exchange_trade_id: format!(
+                    "{}:reconcile:{}",
+                    order.client_order_id,
+                    snapshot.fills.len()
+                ),
                 quantity: delta,
                 price,
                 fee: Decimal::ZERO,
@@ -222,14 +261,60 @@ mod tests {
     #[test]
     fn filled_status_maps_to_fill_and_position_delta() {
         let a = adapter();
-        let resp = json!({ "status": "FILLED", "executedQty": "1.00000000", "price": "100.00000000" });
+        let resp = json!({
+            "status": "FILLED",
+            "executedQty": "1.00000000",
+            "price": "100.00000000",
+            "cummulativeQuoteQty": "100.00000000"
+        });
         let result = a
             .map_order_status_response(&snapshot(OrderStatus::Submitted), &resp)
             .unwrap();
         assert_eq!(result.new_status, Some(OrderStatus::Filled));
         assert_eq!(result.fills_to_add.len(), 1);
         assert_eq!(result.fills_to_add[0].quantity, dec!(1));
+        assert_eq!(result.fills_to_add[0].price, dec!(100));
         assert_eq!(result.positions_delta[0].quantity_delta, dec!(1));
+    }
+
+    #[test]
+    fn market_order_fill_price_derived_from_quote_qty_not_submitted_price() {
+        let a = adapter();
+        // Market order: submitted `price` is 0 (Binance always reports this
+        // for MARKET orders), true execution price must come from
+        // cummulativeQuoteQty / executedQty instead.
+        let resp = json!({
+            "status": "FILLED",
+            "executedQty": "2.00000000",
+            "price": "0.00000000",
+            "cummulativeQuoteQty": "205.00000000"
+        });
+        let result = a
+            .map_order_status_response(&snapshot(OrderStatus::Submitted), &resp)
+            .unwrap();
+        assert_eq!(result.fills_to_add[0].price, dec!(102.5));
+    }
+
+    #[test]
+    fn second_partial_fill_priced_from_incremental_quote() {
+        let a = adapter();
+        let mut snap = snapshot(OrderStatus::PartiallyFilled);
+        // 0.4 already recorded at 100.
+        snap.fills.push(FillSnapshot {
+            exchange_trade_id: "abc123:reconcile:0".into(),
+            quantity: dec!(0.4),
+            price: dec!(100),
+        });
+        // Another 0.2 executed at 112.5: cumulative 0.6 / quote 40 + 22.5 = 62.5.
+        let resp = json!({
+            "status": "FILLED",
+            "executedQty": "0.6",
+            "price": "0",
+            "cummulativeQuoteQty": "62.5"
+        });
+        let result = a.map_order_status_response(&snap, &resp).unwrap();
+        assert_eq!(result.fills_to_add[0].quantity, dec!(0.2));
+        assert_eq!(result.fills_to_add[0].price, dec!(112.5));
     }
 
     #[test]

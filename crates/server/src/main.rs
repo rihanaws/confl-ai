@@ -9,12 +9,6 @@ use confluence_server::routes::AppState;
 use confluence_server::symbol_metadata::SymbolMetadataStore;
 use sqlx::postgres::PgPoolOptions;
 
-/// Symbols this deployment trades in paper mode. A later iteration can pull
-/// this from account risk-config symbols instead of a fixed watchlist; kept
-/// static here so both the metadata and market-data refresh loops have a
-/// concrete driving set without over-fetching all of Binance's symbols.
-const WATCHLIST: &[&str] = &["BTCUSDT", "ETHUSDT"];
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Override: the project .env is authoritative; a DATABASE_URL inherited
@@ -79,17 +73,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // One all-symbols bookTicker request per cycle, filtered to the symbols
+    // currently accepted by order validation
+    // (`SymbolMetadataStore::tradable_symbols`, the same `status == Trading`
+    // gate `validate_order` applies). A single batched call refreshes every
+    // quote together, so no quote ages past the feed's freshness window
+    // because of sequential per-symbol requests, and a symbol can never pass
+    // validation without a price feed backing it. Re-read each cycle since
+    // the tradable set moves as the 60s metadata refresh above runs.
     let refresh_market_data = market_data.clone();
+    let poll_symbols = symbols.clone();
     tokio::spawn(async move {
         loop {
-            for symbol in WATCHLIST {
-                match market_client.fetch_book_ticker(symbol).await {
-                    Ok((bid, ask)) => {
-                        let mut md = refresh_market_data.lock().unwrap();
-                        md.update(symbol, bid, ask, std::time::Instant::now());
+            match market_client.fetch_all_book_tickers().await {
+                Ok(tickers) => {
+                    let tradable: std::collections::HashSet<String> =
+                        poll_symbols.tradable_symbols().into_iter().collect();
+                    let now = std::time::Instant::now();
+                    let mut md = refresh_market_data.lock().unwrap();
+                    for (symbol, bid, ask) in tickers {
+                        if tradable.contains(&symbol) {
+                            md.update(&symbol, bid, ask, now);
+                        }
                     }
-                    Err(e) => tracing::warn!(symbol, error = %e, "book ticker refresh failed; feed will go stale and fail closed"),
                 }
+                Err(e) => tracing::warn!(error = %e, "book ticker refresh failed; feed will go stale and fail closed"),
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }

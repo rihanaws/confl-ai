@@ -84,6 +84,7 @@ pub struct SubmitResult {
 /// Adapter over one exchange venue (paper or live Binance). Zero sqlx in any
 /// implementation — the server owns all persistence and passes/receives
 /// plain data.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ExchangeAdapter: Send + Sync {
     fn mode(&self) -> ExchangeMode;

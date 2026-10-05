@@ -76,24 +76,9 @@ pub async fn run_once(
             Ok(()) => {
                 let mut owner_conn = owner_pool.acquire().await?;
                 let _ = db::mark_command_delivered(&mut owner_conn, cmd.id).await;
-                // A delivered submit_order needs a follow-up poll to learn
-                // whether/how it filled — enqueue the first reconcile_order
-                // pass now; reconcile_order itself does not self-repeat
-                // here (a scheduled periodic sweep is the production
-                // mechanism for repeated polling of still-open orders).
-                if cmd.command_type == "submit_order" {
-                    if let Some(order_id) = extract_order_id(&cmd) {
-                        let _ = db::insert_exchange_command(
-                            &mut owner_conn,
-                            cmd.account_id,
-                            "reconcile_order",
-                            cmd.exchange_mode,
-                            &format!("{order_id}:reconcile:initial"),
-                            &json!({ "order_id": order_id }),
-                        )
-                        .await;
-                    }
-                }
+                // Follow-up reconcile_order commands are enqueued inside the
+                // same transaction as the state change that needs them (see
+                // `dispatch`), so they can't be lost after delivery.
             }
             Err(DispatchOutcome::Retry) => {
                 let mut owner_conn = owner_pool.acquire().await?;
@@ -229,6 +214,7 @@ async fn persist_reconcile_result(
     app_pool: &PgPool,
     account_id: Uuid,
     order_id: Uuid,
+    snapshot: &ReconcileSnapshot,
     result: confluence_exchange::adapter::ReconcileResult,
 ) -> Result<(), DispatchOutcome> {
     let mut tx = db::tenant_tx(app_pool, account_id)
@@ -242,18 +228,42 @@ async fn persist_reconcile_result(
         .await
         .map_err(|_| DispatchOutcome::Retry)?;
 
+    // Optimistic-concurrency check: the adapter computed `result` from
+    // `snapshot`, taken before this transaction. If a concurrent pass (e.g. a
+    // lease-expiry re-claim) already committed fills or a status change since
+    // then, `result` is stale — its deltas and trade ids were derived from
+    // old state and applying it would drop or double-count quantity. Requeue
+    // so the next pass hydrates a fresh snapshot.
+    let snapshot_filled: rust_decimal::Decimal = snapshot.fills.iter().map(|f| f.quantity).sum();
+    if locked.filled_quantity != snapshot_filled || locked.status != snapshot.order.status {
+        return Err(DispatchOutcome::Retry);
+    }
+
+    // Only fills actually inserted count: a duplicate trade id (e.g. a
+    // lease-expiry re-claim replaying the same reconcile pass) is ignored by
+    // `insert_fill`, and its position delta / filled quantity must not be
+    // applied a second time.
+    let mut inserted_fills = Vec::new();
     for fill in &result.fills_to_add {
-        db::insert_fill(&mut tx, account_id, order_id, fill)
+        let inserted = db::insert_fill(&mut tx, account_id, order_id, fill)
             .await
             .map_err(|_| DispatchOutcome::Retry)?;
+        if inserted {
+            inserted_fills.push(fill);
+        }
+    }
+    if !result.fills_to_add.is_empty() && inserted_fills.is_empty() {
+        // The snapshot matched the locked order yet every trade id already
+        // exists: order and fills disagree, so don't silently drop the
+        // result — escalate.
+        return Err(DispatchOutcome::ReconciliationRequired);
     }
 
     // Both adapters (paper matching, Binance reconcile) produce at most one
     // new fill per reconcile pass, so its price is the entry price for any
     // resulting position delta. A future multi-fill-per-pass adapter would
     // need per-symbol price attribution here.
-    let fill_price = result
-        .fills_to_add
+    let fill_price = inserted_fills
         .first()
         .map(|f| f.price)
         .unwrap_or(rust_decimal::Decimal::ZERO);
@@ -268,7 +278,7 @@ async fn persist_reconcile_result(
         // illegal state (e.g. a terminal order somehow reopened) is a bug
         // in the adapter, not something to persist silently.
         if confluence_exchange::order_state::OrderStateMachine::transition(locked.status, new_status).is_ok() {
-            let new_fill_qty: rust_decimal::Decimal = result.fills_to_add.iter().map(|f| f.quantity).sum();
+            let new_fill_qty: rust_decimal::Decimal = inserted_fills.iter().map(|f| f.quantity).sum();
             let filled_qty = locked.filled_quantity + new_fill_qty;
             db::update_order_status(&mut tx, account_id, order_id, new_status, filled_qty)
                 .await
@@ -327,6 +337,16 @@ async fn dispatch(
                 .await
                 .map_err(|_| DispatchOutcome::Retry)?;
             }
+            db::insert_exchange_command(
+                &mut tx,
+                cmd.account_id,
+                "reconcile_order",
+                cmd.exchange_mode,
+                &format!("{order_id}:reconcile:initial"),
+                &json!({ "order_id": order_id }),
+            )
+            .await
+            .map_err(|_| DispatchOutcome::Retry)?;
             tx.commit().await.map_err(|_| DispatchOutcome::Retry)?;
             Ok(())
         }
@@ -339,7 +359,7 @@ async fn dispatch(
                 .reconcile_order(&snapshot)
                 .await
                 .map_err(classify_exchange_error)?;
-            persist_reconcile_result(app_pool, cmd.account_id, order_id, result).await
+            persist_reconcile_result(app_pool, cmd.account_id, order_id, &snapshot, result).await
         }
         "cancel_order" => {
             let Some(order_id) = extract_order_id(cmd) else {
@@ -350,6 +370,56 @@ async fn dispatch(
                 .cancel(&snapshot.order)
                 .await
                 .map_err(|_| DispatchOutcome::Retry)?;
+
+            // Cancel accepted by the exchange: mark the order CancelRequested
+            // so a pending reconciliation pass and the mode-switch open-
+            // activity guard both see it's no longer plain open, without
+            // guessing whether it lands as Cancelled/PartiallyFilled/Filled
+            // — that final state is confirmed by the next reconcile_order.
+            let mut tx = db::tenant_tx(app_pool, cmd.account_id)
+                .await
+                .map_err(|_| DispatchOutcome::Retry)?;
+            let locked = db::lock_order(&mut tx, cmd.account_id, order_id)
+                .await
+                .map_err(|_| DispatchOutcome::Retry)?;
+            if confluence_exchange::order_state::OrderStateMachine::transition(
+                locked.status,
+                confluence_exchange::types::OrderStatus::CancelRequested,
+            )
+            .is_ok()
+            {
+                db::update_order_status(
+                    &mut tx,
+                    cmd.account_id,
+                    order_id,
+                    confluence_exchange::types::OrderStatus::CancelRequested,
+                    locked.filled_quantity,
+                )
+                .await
+                .map_err(|_| DispatchOutcome::Retry)?;
+                db::insert_risk_event(
+                    &mut tx,
+                    cmd.account_id,
+                    "order_cancel_requested",
+                    &json!({ "command_id": cmd.id, "order_id": order_id }),
+                )
+                .await
+                .map_err(|_| DispatchOutcome::Retry)?;
+            }
+            // Confirm the final state (cancelled, or filled/partially filled
+            // if it raced). Same transaction as the CancelRequested change, so
+            // the order can't be left without its follow-up.
+            db::insert_exchange_command(
+                &mut tx,
+                cmd.account_id,
+                "reconcile_order",
+                cmd.exchange_mode,
+                &format!("{order_id}:reconcile:post-cancel"),
+                &json!({ "order_id": order_id }),
+            )
+            .await
+            .map_err(|_| DispatchOutcome::Retry)?;
+            tx.commit().await.map_err(|_| DispatchOutcome::Retry)?;
             Ok(())
         }
         _ => Err(DispatchOutcome::ReconciliationRequired),

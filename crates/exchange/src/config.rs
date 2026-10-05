@@ -1,4 +1,4 @@
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 
 use crate::error::{ExchangeError, Result};
@@ -16,8 +16,20 @@ impl EncryptionKey {
     }
 
     /// Encrypts `plaintext`, binding `aad` (e.g. account_id) so a ciphertext
-    /// cannot be replayed against a different account. Output layout:
+    /// cannot be replayed against a different account. Draws a fresh random
+    /// nonce per call — GCM confidentiality/authenticity requires the
+    /// (key, nonce) pair never repeat, so credential rotations must not
+    /// reuse a deterministic nonce under the same key. Output layout:
     /// `nonce (12 bytes) || ciphertext+tag`.
+    pub fn encrypt_fresh(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng).into();
+        self.encrypt(plaintext, aad, nonce)
+    }
+
+    /// Lower-level variant taking an explicit nonce. Only for tests that
+    /// need deterministic output — production callers must use
+    /// `encrypt_fresh` so nonces are never reused across encryptions under
+    /// the same key.
     pub fn encrypt(&self, plaintext: &[u8], aad: &[u8], nonce: [u8; NONCE_LEN]) -> Result<Vec<u8>> {
         let cipher = Aes256Gcm::new(&self.0);
         let n = Nonce::from_slice(&nonce);

@@ -49,7 +49,7 @@ impl MatchingEngine {
                 Some(Fill {
                     exchange_trade_id: trade_id,
                     quantity,
-                    price: limit,
+                    price: est.price,
                     fee: Decimal::ZERO,
                     fee_asset: String::new(),
                 })
@@ -110,7 +110,7 @@ mod tests {
             "t1".into(),
         );
         assert!(fill.is_some());
-        assert_eq!(fill.unwrap().price, dec!(100));
+        assert_eq!(fill.unwrap().price, dec!(99));
     }
 
     #[test]
@@ -136,7 +136,7 @@ mod tests {
             Some(fresh(dec!(101))),
             "t1".into(),
         );
-        assert!(fill.is_some());
+        assert_eq!(fill.unwrap().price, dec!(101));
     }
 
     #[test]

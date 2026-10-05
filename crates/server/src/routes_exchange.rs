@@ -90,14 +90,21 @@ pub async fn put_exchange_config(
     let mut tx = db::tenant_tx(&state.pool, account_id).await?;
     db::lock_account(&mut tx, account_id).await?;
 
-    let existing = sqlx::query("SELECT mode, version FROM exchange_configs WHERE account_id = $1")
-        .bind(account_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let existing = sqlx::query(
+        "SELECT mode, version, api_key_ciphertext IS NOT NULL AS has_creds
+         FROM exchange_configs WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await?;
 
-    let (old_mode, current_version) = match &existing {
-        Some(r) => (Some(r.get::<String, _>("mode")), r.get::<i32, _>("version")),
-        None => (None, 0),
+    let (old_mode, current_version, had_credentials) = match &existing {
+        Some(r) => (
+            Some(r.get::<String, _>("mode")),
+            r.get::<i32, _>("version"),
+            r.get::<bool, _>("has_creds"),
+        ),
+        None => (None, 0, false),
     };
 
     if let Some(old_mode) = &old_mode {
@@ -124,12 +131,12 @@ pub async fn put_exchange_config(
             let key_ct = body
                 .api_key
                 .as_ref()
-                .map(|k| key.encrypt(k.as_bytes(), aad.as_bytes(), nonce_from_account(account_id, 1)))
+                .map(|k| key.encrypt_fresh(k.as_bytes(), aad.as_bytes()))
                 .transpose()?;
             let secret_ct = body
                 .api_secret
                 .as_ref()
-                .map(|s| key.encrypt(s.as_bytes(), aad.as_bytes(), nonce_from_account(account_id, 2)))
+                .map(|s| key.encrypt_fresh(s.as_bytes(), aad.as_bytes()))
                 .transpose()?;
             (key_ct, secret_ct)
         } else {
@@ -191,20 +198,7 @@ pub async fn put_exchange_config(
     Ok(Json(ExchangeConfigView {
         mode: body.mode,
         testnet: body.testnet,
-        has_credentials: key_ct.is_some() || existing.is_some(),
+        has_credentials: key_ct.is_some() || had_credentials,
         version: new_version,
     }))
-}
-
-/// Deterministic-but-unique nonce derivation: account id bytes + a small
-/// per-field discriminant, so key and secret never reuse a nonce under the
-/// same key. Not a security-sensitive RNG substitute — AES-GCM nonce
-/// uniqueness is the only property required here, and account_id is
-/// globally unique per row.
-fn nonce_from_account(account_id: Uuid, discriminant: u8) -> [u8; 12] {
-    let bytes = account_id.as_bytes();
-    let mut nonce = [0u8; 12];
-    nonce[..11].copy_from_slice(&bytes[..11]);
-    nonce[11] = bytes[11] ^ discriminant;
-    nonce
 }
